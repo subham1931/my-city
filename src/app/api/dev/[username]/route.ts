@@ -250,8 +250,11 @@ export async function GET(
 
   // Rate limit only applies to brand-new developers (not in DB at all).
   // Stale refreshes for existing devs are unlimited ("already in the city").
+  const isInternalBackfill =
+    request.headers.get("x-internal-backfill") === process.env.SUPABASE_SERVICE_ROLE_KEY;
+
   let rateLimitKey: string | null = null;
-  if (process.env.NODE_ENV !== "development" && !cached) {
+  if (process.env.NODE_ENV !== "development" && !cached && !isInternalBackfill) {
     // Auth user ID is preferred over IP to avoid shared-IP false positives
     // (e.g. users behind the same corporate/university NAT sharing a quota).
     let key: string;
@@ -479,6 +482,26 @@ export async function GET(
         actor_id: devId,
         metadata: { login: record.github_login },
       });
+    }
+
+    // Auto-claim: if an auth user exists for this github_login but dev is unclaimed, claim it now
+    if (devId && upserted && !upserted.claimed) {
+      const admin = getSupabaseAdmin();
+      const { data: matchedUsers } = await admin.rpc("find_auth_user_by_github_login", {
+        p_github_login: upserted.github_login,
+      });
+      const matchedUser = (matchedUsers as { id: string }[] | null)?.[0];
+      if (matchedUser?.id) {
+        await admin
+          .from("developers")
+          .update({
+            claimed: true,
+            claimed_by: matchedUser.id,
+            claimed_at: new Date().toISOString(),
+          })
+          .eq("id", devId)
+          .eq("claimed", false);
+      }
     }
 
     // Assign last-place rank to new dev (lightweight, no full recalc)
